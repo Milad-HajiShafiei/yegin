@@ -4,7 +4,11 @@
 
 **A blazing-fast, terminal-based download manager written in Rust.**
 
-[![Rust](https://img.shields.io/badge/Rust-2021-blue?logo=rust)](https://www.rust-lang.org/)
+<img src="./assets/yegin.png">
+
+<br/>
+
+[![Rust](https://img.shields.io/badge/Rust-2024-blue?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 </div>
@@ -33,7 +37,7 @@ Yegin is a cross-platform TUI download manager with chunked parallel downloads, 
 ### From source
 
 ```bash
-git clone https://github.com/your-username/yegin.git
+git clone https://github.com/Milad-HajiShafiei/yegin.git
 cd yegin
 cargo install --path .
 ```
