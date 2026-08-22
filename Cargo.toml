@@ -1,0 +1,26 @@
+[package]
+name = "yegin"
+version = "0.1.0"
+edition = "2024"
+description = "A blazing-fast, terminal-based download manager with parallel chunks, pause/resume, and persistent state"
+license = "MIT"
+repository = "https://github.com/your-username/yegin"
+readme = "README.md"
+keywords = ["download", "tui", "terminal", "manager", "rust"]
+categories = ["command-line-utilities", "network-programming"]
+authors = ["Milad Hajishafiei <https://miladh.sh>"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+reqwest = { version = "0.12", features = ["stream"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+chrono = "0.4"
+url = "2"
+dirs = "5"
+arboard = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
