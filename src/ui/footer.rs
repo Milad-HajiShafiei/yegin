@@ -39,48 +39,7 @@ pub fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(left), footer_layout[0]);
 
-    let right = Line::from(vec![
-        Span::styled("a", Style::default().fg(Theme::GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled(":Add ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("^V", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
-        Span::styled(":Paste ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("c", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
-        Span::styled(":Dir ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("s", Style::default().fg(Theme::GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled(":Start ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("p", Style::default().fg(Theme::YELLOW).add_modifier(Modifier::BOLD)),
-        Span::styled(":Pause ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("r", Style::default().fg(Theme::GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled(":Resume ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("t", Style::default().fg(Theme::ORANGE).add_modifier(Modifier::BOLD)),
-        Span::styled(":Retry ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("d", Style::default().fg(Theme::RED).add_modifier(Modifier::BOLD)),
-        Span::styled(":Del ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("x", Style::default().fg(Theme::PINK).add_modifier(Modifier::BOLD)),
-        Span::styled(":Clear ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("v", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
-        Span::styled(":Hash ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("R", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
-        Span::styled(":Ren ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("o", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
-        Span::styled(":Open ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("L", Style::default().fg(Theme::YELLOW).add_modifier(Modifier::BOLD)),
-        Span::styled(":Limit ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("M", Style::default().fg(Theme::MAUVE).add_modifier(Modifier::BOLD)),
-        Span::styled(":Conc ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("S", Style::default().fg(Theme::MAUVE).add_modifier(Modifier::BOLD)),
-        Span::styled(":Stats ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled(":", Style::default().fg(Theme::ORANGE).add_modifier(Modifier::BOLD)),
-        Span::styled(":Conf ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("↑↓", Style::default().fg(Theme::BLUE).add_modifier(Modifier::BOLD)),
-        Span::styled(":Nav ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("g/G", Style::default().fg(Theme::BLUE).add_modifier(Modifier::BOLD)),
-        Span::styled(":Top/Bot ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("?", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
-        Span::styled(":Help ", Style::default().fg(Theme::TEXT_DIM)),
-        Span::styled("q", Style::default().fg(Theme::RED).add_modifier(Modifier::BOLD)),
-        Span::styled(":Quit", Style::default().fg(Theme::TEXT_DIM)),
-    ]);
+    let right = footer_shortcuts(footer_layout[1].width);
     frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), footer_layout[1]);
 
     // Second row: context-sensitive hints when in a modal
@@ -123,7 +82,10 @@ fn context_hint_line(app: &App) -> Option<Line<'static>> {
         }
         InputMode::Help => {
             Some(Line::from(vec![
-                Span::styled("  Press any key to close", Style::default().fg(Theme::TEXT_DIM).add_modifier(Modifier::ITALIC)),
+                Span::styled("  ↑↓", Style::default().fg(Theme::BLUE).add_modifier(Modifier::BOLD)),
+                Span::styled(":Scroll  ", Style::default().fg(Theme::TEXT_DIM)),
+                Span::styled("? / Esc", Style::default().fg(Theme::TEAL).add_modifier(Modifier::BOLD)),
+                Span::styled(":Close", Style::default().fg(Theme::TEXT_DIM)),
             ]))
         }
         InputMode::DirectoryBrowser => {
@@ -165,4 +127,35 @@ fn context_hint_line(app: &App) -> Option<Line<'static>> {
             ]))
         }
     }
+}
+
+fn footer_shortcuts(width: u16) -> Line<'static> {
+    let bindings: &[(&str, &str, Color)] = if width >= 68 {
+        &[
+            ("a", " Add  ", Theme::GREEN),
+            ("s", " Start  ", Theme::GREEN),
+            ("p", " Pause  ", Theme::YELLOW),
+            ("d", " Delete  ", Theme::RED),
+            ("?", " Help  ", Theme::TEAL),
+            ("q", " Quit", Theme::RED),
+        ]
+    } else {
+        &[
+            ("a", " Add  ", Theme::GREEN),
+            ("?", " Help  ", Theme::TEAL),
+            ("q", " Quit", Theme::RED),
+        ]
+    };
+
+    Line::from(
+        bindings
+            .iter()
+            .flat_map(|(key, label, color)| {
+                [
+                    Span::styled(*key, Style::default().fg(*color).add_modifier(Modifier::BOLD)),
+                    Span::styled(*label, Style::default().fg(Theme::TEXT_DIM)),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )
 }

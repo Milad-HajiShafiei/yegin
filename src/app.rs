@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 const NUM_CHUNKS: usize = 4;
 const CHUNK_SIZE: u64 = 1024 * 1024 * 2; // 2 MB per chunk
@@ -76,6 +76,18 @@ pub struct DownloadItem {
     pub speed_limit: Option<u64>, // bytes/sec, None = unlimited
     pub cancel_token: Arc<AtomicBool>,
     pub created_at: Instant,
+}
+
+/// Return a single safe filename component.  Download URLs and HTTP headers are
+/// untrusted, so neither may choose a path outside the configured directory.
+pub(crate) fn safe_filename(name: &str, fallback: String) -> String {
+    let normalized = name.replace('\\', "/");
+    let candidate = normalized.rsplit('/').next().unwrap_or_default().trim();
+    if candidate.is_empty() || candidate == "." || candidate == ".." || candidate.contains('\0') {
+        fallback
+    } else {
+        candidate.to_string()
+    }
 }
 
 impl DownloadItem {
@@ -279,6 +291,7 @@ pub struct App {
     pub session_start: Instant,
     pub history: Vec<DownloadHistoryEntry>,
     pub history_scroll: usize,
+    pub help_scroll: usize,
     // Queue
     pub max_concurrent: usize,
     // Settings
@@ -413,6 +426,7 @@ impl App {
             session_start: Instant::now(),
             history: Vec::new(),
             history_scroll: 0,
+            help_scroll: 0,
             max_concurrent: 3,
             settings: DownloadSettings::default(),
             settings_selected: 0,
@@ -438,12 +452,10 @@ impl App {
     }
 
     pub fn add_download(&mut self, url: String, filename: Option<String>, sha256: Option<String>) {
-        let save_path = if let Some(name) = filename {
-            self.download_dir.join(&name)
-        } else {
-            let filename = self.filename_from_url(&url);
-            self.download_dir.join(&filename)
-        };
+        let fallback = format!("download_{}", self.next_id);
+        let requested_name = filename.unwrap_or_else(|| self.filename_from_url(&url));
+        let filename = safe_filename(&requested_name, fallback);
+        let save_path = self.download_dir.join(&filename);
 
         let mut item = DownloadItem::new(self.next_id, url, save_path);
         item.expected_sha256 = sha256.filter(|s| !s.is_empty());
@@ -546,8 +558,12 @@ impl App {
             if name.is_empty() || name == "/" {
                 format!("download_{}", self.next_id)
             } else {
-                // Simple percent-decode without extra dependency
-                name.replace("%20", " ").replace("%2F", "/")
+                // Simple percent-decode without extra dependency.  Keep the
+                // result to one path component before using it as a filename.
+                safe_filename(
+                    &name.replace("%20", " ").replace("%2F", "/"),
+                    format!("download_{}", self.next_id),
+                )
             }
         } else {
             format!("download_{}", self.next_id)
@@ -588,6 +604,8 @@ impl App {
                 if is_pending {
                     item.downloaded_bytes = 0;
                     item.total_bytes = None;
+                    item.chunk_downloaded.clear();
+                    item.supports_range = false;
                 }
 
                 let tx = self.event_tx.clone();
@@ -741,6 +759,8 @@ impl App {
             item.error = None;
             item.elapsed = Duration::ZERO;
             item.start_time = None;
+            item.chunk_downloaded.clear();
+            item.supports_range = false;
             // Delete the partial file so progress starts at 0%
             let _ = std::fs::remove_file(&item.save_path);
             self.start_download(id);
@@ -857,8 +877,42 @@ impl App {
 
     pub fn browser_select_current(&mut self) {
         self.download_dir = self.browser_path.clone();
+        self.settings.download_dir = self.download_dir.clone();
         self.input_mode = InputMode::Normal;
         self.set_status(format!("📁 Download dir: {}", self.download_dir.display()));
+    }
+
+    /// Rename a queued, paused, completed, or failed download and its file.
+    /// Active downloads keep an open path in worker tasks, so they must be
+    /// paused before renaming.
+    pub fn rename_download(&mut self, id: usize, requested_name: &str) -> Result<String, String> {
+        let filename = safe_filename(requested_name, String::new());
+        if filename.is_empty() || filename != requested_name {
+            return Err("Filename must not contain path separators".into());
+        }
+
+        let item = self
+            .downloads
+            .iter_mut()
+            .find(|item| item.id == id)
+            .ok_or_else(|| "Download not found".to_string())?;
+        if item.status == DownloadStatus::Downloading {
+            return Err("Pause the download before renaming it".into());
+        }
+
+        let old_path = item.save_path.clone();
+        let parent = old_path.parent().unwrap_or_else(|| Path::new("."));
+        let new_path = parent.join(&filename);
+        if new_path != old_path && new_path.exists() {
+            return Err("A file with that name already exists".into());
+        }
+        if new_path != old_path && old_path.exists() {
+            std::fs::rename(&old_path, &new_path)
+                .map_err(|error| format!("Could not rename file: {error}"))?;
+        }
+        item.filename = filename.clone();
+        item.save_path = new_path;
+        Ok(filename)
     }
 
     // ── Clipboard Paste ───────────────────────────────────────────────────
@@ -944,21 +998,25 @@ impl App {
                 }
             }
             DownloadEvent::Completed { id } => {
-                let entry = if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+                let (entry, should_auto_verify) = if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                     item.status = DownloadStatus::Completed;
                     item.speed = 0.0;
+                    item.elapsed += item.start_time.take().map(|started| started.elapsed()).unwrap_or_default();
                     self.total_completed += 1;
                     self.total_bytes_downloaded += item.downloaded_bytes;
                     let duration = item.elapsed.as_secs();
-                    Some(DownloadHistoryEntry {
-                        filename: item.filename.clone(),
-                        url: item.url.clone(),
-                        size_bytes: item.downloaded_bytes,
-                        completed_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
-                        duration_secs: duration,
-                    })
+                    (
+                        Some(DownloadHistoryEntry {
+                            filename: item.filename.clone(),
+                            url: item.url.clone(),
+                            size_bytes: item.downloaded_bytes,
+                            completed_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+                            duration_secs: duration,
+                        }),
+                        self.settings.auto_verify && item.expected_sha256.is_some(),
+                    )
                 } else {
-                    None
+                    (None, false)
                 };
                 if let Some(entry) = entry {
                     self.history.insert(0, entry);
@@ -968,6 +1026,9 @@ impl App {
                     }
                     self.save_history();
                     self.set_status(format!("✓ {} completed", self.history[0].filename));
+                }
+                if should_auto_verify {
+                    self.verify_download(id);
                 }
                 self.notify_completion();
                 self.process_queue();
@@ -991,6 +1052,10 @@ impl App {
                 filename,
                 total,
             } => {
+                // The destination is fixed before workers start.  Previewing
+                // already applies a server filename when the user accepts it;
+                // changing it here would desynchronize the worker's path.
+                let _ = filename;
                 if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                     // Only upgrade total_bytes — never downgrade it.
                     // A resumed download already has the correct total from the previous session.
@@ -998,10 +1063,6 @@ impl App {
                     let old_total_is_valid = item.total_bytes.is_some_and(|t| t > 0);
                     if new_total_is_valid || !old_total_is_valid {
                         item.total_bytes = total;
-                    }
-                    if !filename.is_empty() {
-                        item.filename = filename;
-                        item.save_path = self.download_dir.join(&item.filename);
                     }
                 }
             }
@@ -1178,10 +1239,18 @@ impl App {
             });
         }
         let file_size = total.unwrap_or(0);
-        // Use saved downloaded_bytes (from state file) — more reliable than file metadata
-        // because the file may not exist yet (no pre-allocation) or may be partially written
-        let existing_bytes = resume_bytes;
-        let resuming = existing_bytes > 0 && supports_range && existing_bytes < file_size;
+        // Per-chunk counters are the authoritative resume offsets.  They also
+        // recover states written by older versions that mistakenly persisted a
+        // sparse file's apparent length as downloaded_bytes.
+        let saved_chunk_bytes = resume_chunk_progress.iter().fold(0_u64, |total, bytes| {
+            total.saturating_add(*bytes)
+        });
+        let existing_bytes = if saved_chunk_bytes > 0 {
+            saved_chunk_bytes
+        } else {
+            resume_bytes
+        };
+        let resuming = existing_bytes > 0 && supports_range && existing_bytes <= file_size;
 
         if resuming {
             let _ = tx.send(DownloadEvent::Progress {
@@ -1313,11 +1382,11 @@ impl App {
         }
 
         // ── Progress reporter ─────────────────────────────────────────────
-        // Use the actual file size on disk for reported progress — not atomic counters
-        // which may be ahead due to race conditions between write and flush.
+        // Sum completed bytes per chunk.  File length is not reliable here:
+        // seeking to a later parallel chunk makes a sparse file appear much
+        // larger than the data actually written.
         // Also periodically sends ChunkProgress events so item.chunk_downloaded
         // stays current during active download (needed for accurate resume).
-        let file_path_clone = path.clone();
         let tx_clone = tx.clone();
         let chunk_dl_clone = chunk_downloaded.clone();
         let report_handle = tokio::spawn(async move {
@@ -1327,13 +1396,12 @@ impl App {
             const ALPHA: f64 = 0.3;
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                // Read actual bytes on disk — this is the truth
-                let on_disk = std::fs::metadata(&file_path_clone)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let downloaded_now = chunk_dl_clone.iter().fold(0_u64, |total, chunk| {
+                    total.saturating_add(chunk.load(Ordering::Relaxed))
+                });
                 let elapsed = last_time.elapsed().as_secs_f64();
                 let instant_speed = if elapsed > 0.0 {
-                    (on_disk.saturating_sub(last_bytes)) as f64 / elapsed
+                    (downloaded_now.saturating_sub(last_bytes)) as f64 / elapsed
                 } else {
                     0.0
                 };
@@ -1341,11 +1409,11 @@ impl App {
                 if smoothed_speed < 1.0 && instant_speed < 1.0 {
                     smoothed_speed = 0.0;
                 }
-                last_bytes = on_disk;
+                last_bytes = downloaded_now;
                 last_time = Instant::now();
                 let _ = tx_clone.send(DownloadEvent::Progress {
                     id,
-                    downloaded: on_disk,
+                    downloaded: downloaded_now,
                     total: if file_size > 0 { Some(file_size) } else { None },
                     speed: smoothed_speed,
                 });
@@ -1382,12 +1450,12 @@ impl App {
 
         // If cancelled (paused), send final progress from disk then stop
         if cancel_token.load(Ordering::Relaxed) {
-            // Wait a moment for in-flight flushes to settle
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let final_on_disk = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let final_downloaded = chunk_downloaded.iter().fold(0_u64, |total, chunk| {
+                total.saturating_add(chunk.load(Ordering::Relaxed))
+            });
             let _ = tx.send(DownloadEvent::Progress {
                 id,
-                downloaded: final_on_disk,
+                downloaded: final_downloaded,
                 total: if file_size > 0 { Some(file_size) } else { None },
                 speed: 0.0,
             });
@@ -1408,11 +1476,19 @@ impl App {
                 error: last_error,
             });
         } else {
-            // Use actual file size on disk for final report
-            let final_on_disk = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let final_downloaded = chunk_downloaded.iter().fold(0_u64, |total, chunk| {
+                total.saturating_add(chunk.load(Ordering::Relaxed))
+            });
+            if file_size > 0 && final_downloaded != file_size {
+                let _ = tx.send(DownloadEvent::Failed {
+                    id,
+                    error: format!("Downloaded {final_downloaded} of {file_size} expected bytes"),
+                });
+                return;
+            }
             let _ = tx.send(DownloadEvent::Progress {
                 id,
-                downloaded: final_on_disk,
+                downloaded: final_downloaded,
                 total: if file_size > 0 { Some(file_size) } else { None },
                 speed: 0.0,
             });
@@ -1440,7 +1516,10 @@ impl App {
             .await
             .map_err(|e| e.to_string())?;
 
-        if !response.status().is_success() {
+        let requires_partial_response = start > 0 || end != u64::MAX;
+        if !response.status().is_success()
+            || (requires_partial_response && response.status() != reqwest::StatusCode::PARTIAL_CONTENT)
+        {
             return Err(format!("HTTP {} for chunk {}", response.status(), chunk_idx));
         }
 
@@ -1459,6 +1538,7 @@ impl App {
 
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
         let mut pos = start;
+        let mut received = 0_u64;
         while let Some(chunk) = stream.next().await {
             // Check if download was cancelled — flush first!
             if cancel_token.load(Ordering::Relaxed) {
@@ -1497,7 +1577,17 @@ impl App {
                 .map_err(|e| e.to_string())?;
             file.flush().await.map_err(|e| e.to_string())?;
             pos += chunk_len;
+            received = received.saturating_add(chunk_len);
             downloaded.fetch_add(chunk_len, Ordering::Relaxed);
+        }
+
+        if end != u64::MAX {
+            let expected = end.saturating_sub(start).saturating_add(1);
+            if received != expected {
+                return Err(format!(
+                    "Chunk {chunk_idx} received {received} of {expected} expected bytes"
+                ));
+            }
         }
 
         Ok(())
@@ -1571,9 +1661,13 @@ struct AppState {
 impl App {
     /// Directory where state files are stored: ~/.yegin/
     pub fn state_dir() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".yegin")
+        if cfg!(test) {
+            std::env::temp_dir().join(format!("yegin-test-state-{}", std::process::id()))
+        } else {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".yegin")
+        }
     }
 
     fn state_file() -> PathBuf {
@@ -1588,14 +1682,18 @@ impl App {
         }
     }
 
-    /// Read a file, falling back to .bak if the main file is corrupt or missing.
-    fn read_with_fallback(path: &Path) -> Option<String> {
-        if let Ok(data) = std::fs::read_to_string(path) {
-            return Some(data);
-        }
-        // Try backup file
+    /// Deserialize a file, falling back to .bak when the main file is absent
+    /// or invalid.
+    fn read_with_fallback<T: DeserializeOwned>(path: &Path) -> Option<T> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .or_else(|| {
         let bak = path.with_extension("json.bak");
-        std::fs::read_to_string(bak).ok()
+                std::fs::read_to_string(bak)
+                    .ok()
+                    .and_then(|data| serde_json::from_str(&data).ok())
+            })
     }
 
     /// Save current download state to disk.
@@ -1607,22 +1705,13 @@ impl App {
             .downloads
             .iter()
             .map(|d| {
-                // For downloads that were downloading/paused, read actual file size from disk
-                // This is the most accurate source of truth for resume offset.
-                let downloaded_bytes = if matches!(d.status, DownloadStatus::Downloading | DownloadStatus::Paused) {
-                    std::fs::metadata(&d.save_path)
-                        .map(|m| m.len())
-                        .unwrap_or(d.downloaded_bytes)
-                } else {
-                    d.downloaded_bytes
-                };
                 DownloadRecord {
                 id: d.id,
                 url: d.url.clone(),
                 filename: d.filename.clone(),
                 save_path: d.save_path.clone(),
                 total_bytes: d.total_bytes,
-                downloaded_bytes,
+                downloaded_bytes: d.downloaded_bytes,
                 status: match &d.status {
                     DownloadStatus::Downloading => DownloadStatus::Paused,
                     _other => d.status.clone(),
@@ -1652,10 +1741,7 @@ impl App {
     /// Load download state from disk and restore downloads.
     pub fn load_state(&mut self) {
         let path = Self::state_file();
-        let Some(data) = Self::read_with_fallback(&path) else {
-            return;
-        };
-        let Ok(state): Result<AppState, _> = serde_json::from_str(&data) else {
+        let Some(state) = Self::read_with_fallback::<AppState>(&path) else {
             return;
         };
 
@@ -1726,8 +1812,7 @@ impl App {
 
     pub fn load_history(&mut self) {
         let path = Self::history_file();
-        if let Some(data) = Self::read_with_fallback(&path) {
-            if let Ok(mut history) = serde_json::from_str::<Vec<DownloadHistoryEntry>>(&data) {
+        if let Some(mut history) = Self::read_with_fallback::<Vec<DownloadHistoryEntry>>(&path) {
                 // Enforce size limit on load
                 if history.len() > 100 {
                     history.truncate(100);
@@ -1735,7 +1820,6 @@ impl App {
                 self.history = history;
                 // Restore total bytes from history
                 self.total_bytes_downloaded = self.history.iter().map(|e| e.size_bytes).sum();
-            }
         }
     }
 
@@ -1756,10 +1840,8 @@ impl App {
 
     pub fn load_settings(&mut self) {
         let path = Self::settings_file();
-        if let Some(data) = Self::read_with_fallback(&path) {
-            if let Ok(settings) = serde_json::from_str::<DownloadSettings>(&data) {
-                self.settings = settings;
-            }
+        if let Some(settings) = Self::read_with_fallback::<DownloadSettings>(&path) {
+            self.settings = settings;
         }
     }
 
@@ -2448,6 +2530,91 @@ mod tests {
         assert_eq!(app2.downloads[0].total_bytes, Some(1024 * 100));
         assert_eq!(app2.downloads[0].downloaded_bytes, 5000);
         assert_eq!(app2.downloads[0].status, DownloadStatus::Completed);
+    }
+
+    #[test]
+    fn tests_use_an_isolated_state_directory() {
+        assert_ne!(App::state_dir(), dirs::home_dir().unwrap().join(".yegin"));
+    }
+
+    #[test]
+    fn add_download_keeps_untrusted_names_inside_download_dir() {
+        let mut app = make_app();
+        app.download_dir = PathBuf::from("/tmp/yegin-downloads");
+
+        app.add_download("https://example.com/file".into(), Some("../../outside.bin".into()), None);
+        assert_eq!(app.downloads[0].save_path, PathBuf::from("/tmp/yegin-downloads/outside.bin"));
+
+        app.add_download("https://example.com/file".into(), Some("/etc/passwd".into()), None);
+        assert_eq!(app.downloads[1].save_path, PathBuf::from("/tmp/yegin-downloads/passwd"));
+    }
+
+    #[test]
+    fn metadata_does_not_change_a_running_download_path() {
+        let mut app = make_app();
+        let id = add_test_download(&mut app, "https://example.com/file");
+        let original_path = app.downloads[0].save_path.clone();
+
+        app.update_downloads_from_event(DownloadEvent::Metadata {
+            id,
+            filename: "server-name.zip".into(),
+            total: Some(42),
+        });
+
+        assert_eq!(app.downloads[0].save_path, original_path);
+        assert_eq!(app.downloads[0].filename, "file");
+        assert_eq!(app.downloads[0].total_bytes, Some(42));
+    }
+
+    #[test]
+    fn browser_directory_selection_updates_persistent_settings() {
+        let mut app = make_app();
+        app.browser_path = PathBuf::from("/tmp/yegin-browser-choice");
+        app.browser_select_current();
+        assert_eq!(app.download_dir, app.settings.download_dir);
+    }
+
+    #[test]
+    fn completion_records_active_elapsed_time_and_auto_verifies() {
+        let mut app = make_app();
+        let path = std::env::temp_dir().join(format!("yegin-verify-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let id = add_test_download(&mut app, "https://example.com/file");
+        let item = &mut app.downloads[0];
+        item.save_path = path.clone();
+        item.downloaded_bytes = 3;
+        item.status = DownloadStatus::Downloading;
+        item.start_time = Some(Instant::now() - Duration::from_secs(2));
+        item.expected_sha256 = Some(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        );
+
+        app.update_downloads_from_event(DownloadEvent::Completed { id });
+
+        assert!(app.history[0].duration_secs >= 2);
+        assert_eq!(app.downloads[0].verify_status, VerifyStatus::Pass);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rename_download_moves_the_file_and_rejects_active_downloads() {
+        let mut app = make_app();
+        let directory = std::env::temp_dir().join(format!("yegin-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let old_path = directory.join("old.txt");
+        std::fs::write(&old_path, b"contents").unwrap();
+        let id = add_test_download(&mut app, "https://example.com/file");
+        app.downloads[0].save_path = old_path.clone();
+        app.downloads[0].filename = "old.txt".into();
+
+        assert_eq!(app.rename_download(id, "new.txt").unwrap(), "new.txt");
+        assert!(!old_path.exists());
+        assert!(directory.join("new.txt").exists());
+
+        app.downloads[0].status = DownloadStatus::Downloading;
+        assert!(app.rename_download(id, "later.txt").is_err());
+        let _ = std::fs::remove_file(directory.join("new.txt"));
+        let _ = std::fs::remove_dir(directory);
     }
 
     // ── App::verify_download ─────────────────────────────────────────────

@@ -12,10 +12,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+struct TerminalGuard {
+    active: bool,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     enable_raw_mode()?;
+    let mut terminal_guard = TerminalGuard { active: true };
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -91,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    terminal_guard.active = false;
 
     Ok(())
 }
@@ -181,10 +196,27 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         },
-        InputMode::Help => {
-            // Any key closes help
-            app.input_mode = InputMode::Normal;
-        }
+        InputMode::Help => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.help_scroll = app.help_scroll.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                app.help_scroll = app.help_scroll.saturating_add(5);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                app.help_scroll = 0;
+            }
+            KeyCode::Char('?') | KeyCode::Char('q') => {
+                app.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        },
         InputMode::DirectoryBrowser => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 app.browser_select_up();
@@ -434,6 +466,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
                 // Toggle help
                 KeyCode::Char('?') => {
                     app.input_mode = InputMode::Help;
+                    app.help_scroll = 0;
                 }
 
                 _ => {}
@@ -517,7 +550,7 @@ fn handle_text_input(app: &mut App, key: KeyEvent) {
                 }
                 InputMode::RenameFile => {
                     if app.selected < app.downloads.len() {
-                        let dl = &mut app.downloads[app.selected];
+                        let dl = &app.downloads[app.selected];
                         if !value.is_empty() {
                             // Preserve the original extension if the new name has none
                             let final_name = if let Some(ext) = Path::new(&dl.filename).extension() {
@@ -529,9 +562,11 @@ fn handle_text_input(app: &mut App, key: KeyEvent) {
                             } else {
                                 value.clone() // no original extension to preserve
                             };
-                            dl.filename = final_name.clone();
-                            dl.save_path = app.download_dir.join(&final_name);
-                            app.set_status(format!("Renamed to {}", final_name));
+                            let id = dl.id;
+                            match app.rename_download(id, &final_name) {
+                                Ok(name) => app.set_status(format!("Renamed to {}", name)),
+                                Err(error) => app.set_status(format!("⚠ {error}")),
+                            }
                         }
                     }
                     app.input_mode = InputMode::Normal;

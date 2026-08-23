@@ -1,5 +1,6 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::theme::Theme;
 
@@ -35,6 +36,80 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Create a centered popup that keeps enough room for its content whenever
+/// the terminal can provide it.
+pub fn centered_rect_with_min(
+    percent_x: u16,
+    percent_y: u16,
+    min_width: u16,
+    min_height: u16,
+    area: Rect,
+) -> Rect {
+    let width = ((area.width as u32 * percent_x as u32 / 100) as u16)
+        .max(min_width)
+        .min(area.width);
+    let height = ((area.height as u32 * percent_y as u32 / 100) as u16)
+        .max(min_height)
+        .min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Truncate a string to terminal cell width without splitting UTF-8.
+pub fn truncate_end(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut result = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + char_width > max_width - 1 {
+            break;
+        }
+        result.push(character);
+        width += char_width;
+    }
+    result.push('…');
+    result
+}
+
+/// Truncate from the beginning, preserving the filename/path suffix.
+pub fn truncate_start(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut suffix = String::new();
+    let mut width = 0;
+    for character in value.chars().rev() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + char_width > max_width - 1 {
+            break;
+        }
+        suffix.insert(0, character);
+        width += char_width;
+    }
+    format!("…{suffix}")
 }
 
 /// Linearly interpolate a single color channel between two values.
@@ -328,6 +403,40 @@ mod tests {
         assert!(result.y >= 5);
         assert!(result.x + result.width <= 90);
         assert!(result.y + result.height <= 35);
+    }
+
+    #[test]
+    fn centered_rect_with_min_fits_normal_terminal_content() {
+        let result = centered_rect_with_min(45, 16, 48, 7, Rect::new(0, 0, 80, 24));
+        assert_eq!(result.width, 48);
+        assert_eq!(result.height, 7);
+        assert_eq!(result.x, 16);
+        assert_eq!(result.y, 8);
+    }
+
+    #[test]
+    fn centered_rect_with_min_never_exceeds_tiny_terminal() {
+        let area = Rect::new(0, 0, 8, 3);
+        assert_eq!(centered_rect_with_min(45, 16, 48, 7, area), area);
+    }
+
+    #[test]
+    fn truncation_is_utf8_safe_and_width_bounded() {
+        let value = "گزارش-🚀-دانلود";
+        let end = truncate_end(value, 7);
+        let start = truncate_start(value, 7);
+        assert!(UnicodeWidthStr::width(end.as_str()) <= 7);
+        assert!(UnicodeWidthStr::width(start.as_str()) <= 7);
+        assert!(end.ends_with('…'));
+        assert!(start.starts_with('…'));
+    }
+
+    #[test]
+    fn truncation_handles_zero_width_without_panicking() {
+        assert_eq!(truncate_end("گزارش", 0), "");
+        assert_eq!(truncate_start("گزارش", 0), "");
+        assert_eq!(truncate_end("گزارش", 1), "…");
+        assert_eq!(truncate_start("گزارش", 1), "…");
     }
 
     // ── format_speed edge cases ──────────────────────────────────────────

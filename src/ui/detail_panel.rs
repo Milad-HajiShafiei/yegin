@@ -3,7 +3,7 @@ use ratatui::widgets::*;
 
 use crate::app::{App, DownloadStatus, VerifyStatus};
 use super::theme::Theme;
-use super::utils::{fade_color, format_bytes, format_speed, lerp_channel, color_to_rgb, render_detail_line, InfoLineParams};
+use super::utils::{fade_color, format_bytes, format_speed, lerp_channel, color_to_rgb, render_detail_line, truncate_end, truncate_start, InfoLineParams};
 
 pub fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
@@ -57,7 +57,7 @@ pub fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     // URL
     let max_url_len = inner.width.saturating_sub(8) as usize;
-    let display_url = if dl.url.len() > max_url_len { format!("{}…", &dl.url[..max_url_len - 1]) } else { dl.url.clone() };
+    let display_url = truncate_end(&dl.url, max_url_len);
     render_detail_line(frame, Rect { x: inner.x, y: info_start, width: inner.width, height: 1 }, InfoLineParams { icon: "🔗", icon_color: Theme::TEAL, label: "URL", value: &display_url, value_color: Theme::TEXT_DIM, fade: fade_factor });
 
     // Progress
@@ -143,7 +143,7 @@ pub fn draw_detail_panel(frame: &mut Frame, area: Rect, app: &App) {
     // Save path
     let path_display = dl.save_path.display().to_string();
     let max_path_len = inner.width.saturating_sub(8) as usize;
-    let display_path = if path_display.len() > max_path_len { format!("…{}", &path_display[path_display.len() - max_path_len + 1..]) } else { path_display };
+    let display_path = truncate_start(&path_display, max_path_len);
     render_detail_line(frame, Rect { x: inner.x, y: info_start + 9, width: inner.width, height: 1 }, InfoLineParams { icon: "💾", icon_color: Theme::PINK, label: "Path", value: &display_path, value_color: Theme::TEXT_DIM, fade: fade_factor });
 
     // Verify status

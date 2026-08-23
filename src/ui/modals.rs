@@ -1,14 +1,14 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{App, InputMode};
+use crate::app::{safe_filename, App, InputMode};
 use super::theme::Theme;
-use super::utils::{centered_rect, format_bytes, format_speed};
+use super::utils::{centered_rect, centered_rect_with_min, format_bytes, format_speed, truncate_end, truncate_start};
 
 // ── Input Modal (URL, name, SHA-256, speed limit, concurrency, rename) ────
 
 pub fn draw_input_modal(frame: &mut Frame, area: Rect, title: &str, value: &str) {
-    let popup_area = centered_rect(45, 16, area);
+    let popup_area = centered_rect_with_min(45, 16, 48, 7, area);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(
         Block::default().style(Style::default().bg(Theme::SHADOW)),
@@ -65,7 +65,7 @@ pub fn draw_input_modal(frame: &mut Frame, area: Rect, title: &str, value: &str)
 // ── Confirm Delete Modal ───────────────────────────────────────────────────
 
 pub fn draw_confirm_modal(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(40, 14, area);
+    let popup_area = centered_rect_with_min(40, 14, 40, 7, area);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(
         Block::default().style(Style::default().bg(Theme::SHADOW)),
@@ -120,8 +120,8 @@ pub fn draw_confirm_modal(frame: &mut Frame, area: Rect, app: &App) {
 
 // ── Help Overlay ───────────────────────────────────────────────────────────
 
-pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(55, 65, area);
+pub fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = centered_rect_with_min(55, 90, 50, 18, area);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(
         Block::default().style(Style::default().bg(Theme::SHADOW)),
@@ -201,7 +201,13 @@ pub fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(help_lines), padded);
+    let scroll = app
+        .help_scroll
+        .min(help_lines.len().saturating_sub(padded.height as usize));
+    frame.render_widget(
+        Paragraph::new(help_lines.into_iter().skip(scroll).collect::<Vec<_>>()),
+        padded,
+    );
 }
 
 // ── Directory Browser ──────────────────────────────────────────────────────
@@ -410,7 +416,7 @@ pub fn draw_stats_dashboard(frame: &mut Frame, area: Rect, app: &App) {
             let is_selected = i == scroll;
             let bg = if is_selected { Theme::BG_CARD } else { Theme::MODAL_BG };
             let name_max = 38;
-            let display_name = if entry.filename.len() > name_max { format!("{}…", &entry.filename[..name_max - 1]) } else { entry.filename.clone() };
+            let display_name = truncate_end(&entry.filename, name_max);
             let dur_str = if entry.duration_secs >= 3600 { format!("{}h {}m", entry.duration_secs / 3600, (entry.duration_secs % 3600) / 60) }
                 else if entry.duration_secs >= 60 { format!("{}m {}s", entry.duration_secs / 60, entry.duration_secs % 60) }
                 else { format!("{}s", entry.duration_secs) };
@@ -439,7 +445,7 @@ pub fn draw_stats_dashboard(frame: &mut Frame, area: Rect, app: &App) {
 // ── Settings Modal ─────────────────────────────────────────────────────────
 
 pub fn draw_settings_modal(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(50, 18, area);
+    let popup_area = centered_rect_with_min(50, 18, 62, 10, area);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(
         Block::default().style(Style::default().bg(Theme::SHADOW)),
@@ -545,7 +551,7 @@ pub fn draw_settings_modal(frame: &mut Frame, area: Rect, app: &App) {
 // ── Preview Modal ──────────────────────────────────────────────────────────
 
 pub fn draw_preview_modal(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(50, 28, area);
+    let popup_area = centered_rect_with_min(50, 28, 60, 14, area);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(
         Block::default().style(Style::default().bg(Theme::SHADOW)),
@@ -602,15 +608,14 @@ pub fn draw_preview_modal(frame: &mut Frame, area: Rect, app: &App) {
 
     // URL
     let max_url_len = inner.width.saturating_sub(14) as usize;
-    let display_url = if preview.url.len() > max_url_len {
-        format!("{}…", &preview.url[..max_url_len - 1])
-    } else {
-        preview.url.clone()
-    };
+    let display_url = truncate_end(&preview.url, max_url_len);
     render_preview_line(frame, &mut y, inner.x, inner.width, PreviewLineParams { icon: "🔗", icon_color: Theme::TEAL, label: "URL", value: &display_url, value_color: Theme::TEXT_DIM });
 
-    // Filename
-    render_preview_line(frame, &mut y, inner.x, inner.width, PreviewLineParams { icon: "📄", icon_color: Theme::ORANGE, label: "File", value: &preview.filename, value_color: Theme::TEXT_BRIGHT });
+    // The pending custom filename wins when the download is created, so show
+    // the same sanitized name and destination the worker will use.
+    let requested_name = app.pending_filename_stored.as_deref().unwrap_or(&preview.filename);
+    let filename = safe_filename(requested_name, app.filename_from_url(&preview.url));
+    render_preview_line(frame, &mut y, inner.x, inner.width, PreviewLineParams { icon: "📄", icon_color: Theme::ORANGE, label: "File", value: &filename, value_color: Theme::TEXT_BRIGHT });
 
     // Divider
     let divider = Line::from(vec![Span::styled(
@@ -646,14 +651,10 @@ pub fn draw_preview_modal(frame: &mut Frame, area: Rect, app: &App) {
     render_preview_line(frame, &mut y, inner.x, inner.width, PreviewLineParams { icon: "⚡", icon_color: Theme::TEAL, label: "Ranges", value: range_text, value_color: range_color });
 
     // Destination
-    let dest = app.download_dir.join(&preview.filename);
+    let dest = app.download_dir.join(&filename);
     let dest_str = dest.display().to_string();
     let max_dest_len = inner.width.saturating_sub(14) as usize;
-    let display_dest = if dest_str.len() > max_dest_len {
-        format!("…{}", &dest_str[dest_str.len() - max_dest_len + 1..])
-    } else {
-        dest_str
-    };
+    let display_dest = truncate_start(&dest_str, max_dest_len);
     render_preview_line(frame, &mut y, inner.x, inner.width, PreviewLineParams { icon: "💾", icon_color: Theme::PINK, label: "Save to", value: &display_dest, value_color: Theme::TEXT_DIM });
 
     // Divider

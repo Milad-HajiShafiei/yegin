@@ -1,8 +1,9 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
-use super::utils::{color_to_rgb, fade_color, format_bytes, format_speed, lerp_channel};
+use super::utils::{color_to_rgb, fade_color, format_bytes, format_speed, lerp_channel, truncate_end};
 use crate::app::{App, DownloadItem, DownloadStatus};
 
 pub fn draw_download_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -112,12 +113,8 @@ impl DownloadItem {
 
         // File name
         let max_name_len = (width as usize).saturating_sub(32).max(12);
-        let display_name = if self.filename.len() > max_name_len {
-            format!("{}…", &self.filename[..max_name_len - 1])
-        } else {
-            self.filename.clone()
-        };
-        let name_len = display_name.len();
+        let display_name = truncate_end(&self.filename, max_name_len);
+        let name_len = UnicodeWidthStr::width(display_name.as_str());
 
         // Right-aligned info
         let mut right_spans: Vec<Span> = Vec::new();
@@ -414,11 +411,7 @@ impl DownloadItem {
             ]));
         } else if let DownloadStatus::Failed(ref err) = self.status {
             let max_err_len = (width as usize).saturating_sub(10);
-            let display_err = if err.len() > max_err_len {
-                format!("{}…", &err[..max_err_len - 1])
-            } else {
-                err.clone()
-            };
+            let display_err = truncate_end(err, max_err_len);
             lines.push(Line::from(vec![
                 Span::styled("    ✗  ", Style::default().fg(Theme::RED)),
                 Span::styled(

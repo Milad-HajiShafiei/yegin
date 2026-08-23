@@ -54,7 +54,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         InputMode::Previewing => draw_preview_modal(frame, area, app),
         InputMode::RenameFile => draw_input_modal(frame, area, "Rename file", &app.input_buf),
         InputMode::ConfirmDelete => draw_confirm_modal(frame, area, app),
-        InputMode::Help => draw_help_overlay(frame, area),
+        InputMode::Help => draw_help_overlay(frame, area, app),
         InputMode::DirectoryBrowser => draw_directory_browser(frame, area, app),
         InputMode::SettingSpeedLimit => draw_input_modal(frame, area, "Speed limit (e.g. 500k, 10m, 0=unlimited)", &app.input_buf),
         InputMode::SettingConcurrency => draw_input_modal(frame, area, "Max concurrent downloads (1-10)", &app.input_buf),
